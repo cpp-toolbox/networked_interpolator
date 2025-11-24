@@ -8,21 +8,12 @@
 #include "sbpt_generated_includes.hpp"
 
 /**
- * @brief A network-aware interpolator that smooths discrete, jittery network updates.
+ * @brief A network-aware interpolator
  *
  * This interpolator receives discrete state updates from a remote source (e.g., a game server)
  * at an *average* frequency R1, which can vary due to network latency and jitter. Locally, it
  * produces smooth interpolated states at a higher frequency R2 (e.g., render frame rate) while
  * maintaining a stable interpolation interval driven by a local clock.
- *
- * @note
- * - Incoming network updates are buffered immediately when received via register_new_state().
- *   Their arrival times may vary due to network conditions.
- * - The *active interpolation window* (the two states being interpolated between) is advanced
- *   **only when the local receive signal fires** (via PeriodicSignal). This ensures a stable,
- *   jitter-resistant interpolation cadence.
- * - If no new network state has arrived when the signal fires, the interpolator “holds” the last
- *   end state rather than extrapolating forward, preventing visible discontinuities.
  *
  * @note the term "interpolation window" is the active start/end state being used during interpolation
  *
@@ -36,6 +27,13 @@ template <typename StateToInterpolate> class NetworkedInterpolator {
     struct StartStateChangedSignal {
         StateToInterpolate state;
     };
+
+    NetworkedPeriodicSignalQuantizer<StateToInterpolate> networked_periodic_signal_quantizer;
+
+    bool logging_enabled = false;
+
+    /// An optional function that can be passed that will augment the logging
+    std::optional<std::function<std::string(const StateToInterpolate &)>> state_to_interpolate_to_string = std::nullopt;
 
     /**
      * @brief a signal that other non interpolated systems should bind to to synchronize with the interpolation
@@ -55,15 +53,75 @@ template <typename StateToInterpolate> class NetworkedInterpolator {
      */
     SignalEmitter start_state_changed_synchronization;
 
+    unsigned int num_extra_states_to_be_left_in_the_buffer;
+
     /**
      * @brief Construct a networked interpolator with a user-defined interpolation function and rate.
      *
      * @param interpolate_func Function defining how to interpolate between two states.
      * @param receive_frequency Frequency (Hz) representing the expected network tick rate.
      */
-    NetworkedInterpolator(InterpolationFunc interpolate_func, float receive_frequency)
-        : interpolate_func(interpolate_func), idealized_receive_signal(receive_frequency),
-          first_interpolation_window_has_been_initialized(false) {}
+    NetworkedInterpolator(InterpolationFunc interpolate_func, float receive_frequency,
+                          // keep these parameters at end.
+                          bool logging_enabled = false,
+                          std::optional<std::function<std::string(const StateToInterpolate &)>>
+                              state_to_interpolate_to_string = std::nullopt)
+        : interpolate_func(interpolate_func), first_interpolation_window_has_been_initialized(false),
+          logging_enabled(logging_enabled), state_to_interpolate_to_string(state_to_interpolate_to_string) {
+        networked_periodic_signal_quantizer.output_emitter.template connect<std::optional<StateToInterpolate>>(
+            [&](const std::optional<StateToInterpolate> &new_state) {
+                LogSection _(global_logger, "just received new state", logging_enabled);
+                if (new_state.has_value()) {
+                    global_logger.debug("had value");
+
+                    // startfold initialized first interpolation window
+                    if (active_start_state == std::nullopt) {
+                        active_start_state = new_state;
+                        global_logger.debug("just initialized first start state");
+                        return;
+                    } else if (active_end_state == std::nullopt) {
+                        active_end_state = new_state;
+                        global_logger.debug("just initialized first end state ");
+                        first_interpolation_window_has_been_initialized = true;
+                        global_logger.debug("interpolation window is initialized");
+                        start_state_changed_synchronization.emit(StartStateChangedSignal{active_start_state.value()});
+                        return;
+                    }
+                    // endfold
+
+                    global_logger.debug("regular interpolation window change");
+                    active_start_state = active_end_state;
+                    active_end_state = new_state;
+                    // we know this is anew state because we are in the new_state.has_value() case.
+                    start_state_changed_synchronization.emit(StartStateChangedSignal{active_start_state.value()});
+                } else {
+                    global_logger.debug("no value");
+                    // NOTE: this is a very important line, we only ever get here if we haven't registered a new state
+                    // since last time this was called, this occurs when the network variance causes one of the packets
+                    // to take longer than it regularly would. If we didn't add this line then the active start/end
+                    // state so the interpolation window is the same as the last interpolation window which would look
+                    // strange because it would look like you interpolate from point a to point b, and then do that
+                    // again, this line fixes that because it makes a "constant interpolation window" as the start and
+                    // end state become the same, once this is true all interpolation attempts always just yield
+                    // active_end_state which is the most up to date state, which is better than doing the same
+                    // interpolation again.
+                    active_start_state = active_end_state;
+                }
+
+                log_active_interpolation_window();
+            });
+    }
+
+    void log_active_interpolation_window() {
+        if (state_to_interpolate_to_string) {
+            LogSection _(global_logger, "active interpolation window");
+            global_logger.debug("START: {}", (*state_to_interpolate_to_string)(active_start_state.value()));
+            global_logger.debug("END: {}", (*state_to_interpolate_to_string)(active_end_state.value()));
+            global_logger.debug("t: {}", active_t);
+        } else {
+            global_logger.debug("interpolating between start and end with t : {}", active_t);
+        }
+    }
 
     /**
      * @brief Register a new incoming network state.
@@ -73,12 +131,7 @@ template <typename StateToInterpolate> class NetworkedInterpolator {
      * receive signal rate inside update_interpolated_state().
      */
     void register_new_state(const StateToInterpolate &new_state) {
-        incoming_state_buffer.push_back(new_state);
-
-        // prevent unbounded growth in pathological network conditions.
-        constexpr std::size_t kMaxBufferedStates = 32;
-        if (incoming_state_buffer.size() > kMaxBufferedStates)
-            incoming_state_buffer.pop_front();
+        networked_periodic_signal_quantizer.push(new_state);
     }
 
     /**
@@ -94,113 +147,30 @@ template <typename StateToInterpolate> class NetworkedInterpolator {
      *     * Otherwise, copy active_end_state to active_start_state to hold the last known state.
      */
     void update() {
-        // initialize window if not yet and we have enough buffered states
-        if (!first_interpolation_window_has_been_initialized) { // A
-            bool can_create_first_interpolation_window = incoming_state_buffer.size() >= 2;
-            if (can_create_first_interpolation_window) { // B
-                active_start_state = incoming_state_buffer.front();
-                incoming_state_buffer.pop_front();
-                active_end_state = incoming_state_buffer.front();
-                incoming_state_buffer.pop_front();
-                first_interpolation_window_has_been_initialized = true;
-            } else { // C
-                // not enough data yet to interpolate, stop the update process, hopefully theres some data on the next
-                // call
-                return;
-            }
+        LogSection _(global_logger, "networked interpolator update", logging_enabled);
+
+        // TODO: do we need a function called get progress at the last periodic signal processing? I think if I want to
+        // be super safe, because later down this function we will get the progress and in that time it could have
+        // rolled over... If interpolation seems to flicker then this might be the culprit
+        networked_periodic_signal_quantizer.update();
+
+        if (not first_interpolation_window_has_been_initialized) {
+            global_logger.debug("interpolation window not initialized not running anything");
+            return;
         }
 
-        // NOTE: the only way you cannot get here is when fiwhbi is false, therefore when fiwhbi is true, then you will
-        // get here. The only way for fiwhbi to become true is by running the body of B, which makes both
-        // active_start_state and active_end_state initialized and no longer nullopt, therefore the usage of .value() is
-        // justified below.
-        // NOTE:0: Also note that this implies that update_interpolation_window has this property as a
-        // precondition because its only ever called in here
+        active_t = networked_periodic_signal_quantizer.output_signal
+                       .cycle_progress_at_last_process_and_get_signal_call; // [0,1] through current local interval
 
-        // compute interpolation based on current progress
-        active_t = idealized_receive_signal.get_cycle_progress(); // [0,1] through current local interval
+        log_active_interpolation_window();
 
+        // .value() usage is validated by the fact that the interpolation window has been initialized
         current_interpolated_state = interpolate_func(active_start_state.value(), active_end_state.value(), active_t);
 
-        if (idealized_receive_signal.process_and_get_signal()) {
-            update_interpolation_window();
+        if (state_to_interpolate_to_string) {
+            global_logger.debug("the interpolated state is: {}",
+                                (*state_to_interpolate_to_string)(current_interpolated_state.value()));
         }
-    }
-
-    /**
-     * @brief Updates the active state window based on the incoming state buffer.
-     *
-     * This function manages the interpolation window by updating `active_start_state`
-     * and `active_end_state` according to the states available in `incoming_state_buffer`.
-     *
-     * Suppose we have some state updates sent from the server to client:
-     *
-     * s1, s2, s3, s4, ...
-     *
-     */
-    void update_interpolation_window() {
-
-        bool new_states_received_since_last_time_this_was_called = not incoming_state_buffer.empty();
-        bool no_new_states_received_since_last_time_this_was_called =
-            not new_states_received_since_last_time_this_was_called;
-
-        if (new_states_received_since_last_time_this_was_called) { // A
-
-            if (incoming_state_buffer.size() == 1) {
-                // Normal update
-                active_start_state = active_end_state;
-                active_end_state = incoming_state_buffer.front();
-                incoming_state_buffer.pop_front();
-            } else {
-                // catch-up: take the last two states
-                // TODO: document the implications of the catch up method because it surely should cause some sort of
-                // jitter.
-                auto it = incoming_state_buffer.end();
-                --it; // last element
-                active_end_state = *it;
-                --it; // second to last element
-                active_start_state = *it;
-
-                // Remove all processed states from buffer
-                incoming_state_buffer.erase(incoming_state_buffer.begin(), incoming_state_buffer.end());
-            }
-        }
-
-        // NOTE: once here is reached then the incoming state buffer is completely empty
-
-        if (no_new_states_received_since_last_time_this_was_called) { // B
-            // NOTE: this is a very important line, we only ever get here if we haven't registered a new state since
-            // last time this was called, this occurs when the network variance causes one of the packets to take longer
-            // than it regularly would. If we didn't add this line then the active start/end state so the interpolation
-            // window is the same as the last interpolation window which would look strange because it would look like
-            // you interpolate from point a to point b, and then do that again, this line fixes that because it makes a
-            // "constant interpolation window" as the start and end state become the same, once this is true all
-            // interpolation attempts always just yield active_end_state which is the most up to date state, which is
-            // better than doing the same interpolation again.
-            active_start_state = active_end_state;
-        }
-
-        // NOTE: this variable being true means that you haven't received an update from the server in two iterations,
-        // this most likely means that there's some sort of internet problem going on, and here's how it effects the
-        // interpolation window creation process. Lets say the server sent over some states s1, s2, s3, ... . On
-        // your computer you receive s1, s2, s3 and then for some reason none of the other states get there for a
-        // moment, then the sequence of interpolation windows created inside of this system is like this:
-        // s1-s2 (A), s2-s3 (A), s3-s3 (B) , s3-s3 (B), s3-s3 (B), ...
-        // note: the upper case characters represent which if statement above created the window
-        // So in the above image we can see that the second time the (B) logic is used, the start state is the same
-        // as it was in the previous or equivalently the interpolation window is duplicated. Whenever we are in this
-        // state, then we should not emit the start state changed signal, or else for example the sound system would
-        // repeatedly play the same sound over and over as its getting duplicated
-        bool at_least_two_consecutive_empty_incoming_state_buffer_updates =
-            incoming_state_buffer_was_empty_on_last_update and no_new_states_received_since_last_time_this_was_called;
-
-        if (not at_least_two_consecutive_empty_incoming_state_buffer_updates) {
-            start_state_changed_synchronization.emit(
-                StartStateChangedSignal{active_start_state.value()}); // value usage justified by NOTE:0
-        }
-
-        // update for the next update
-        incoming_state_buffer_was_empty_on_last_update = incoming_state_buffer.empty();
     }
 
     /// @brief Get the current interpolated state.
@@ -215,11 +185,6 @@ template <typename StateToInterpolate> class NetworkedInterpolator {
     const std::optional<StateToInterpolate> &get_active_end_state() const { return active_end_state; }
 
   private:
-    /// @brief Buffered incoming network states.
-    std::deque<StateToInterpolate> incoming_state_buffer;
-
-    bool incoming_state_buffer_was_empty_on_last_update = true; // initially there's nothing there
-
     /**
      * @brief The currently active start state (previous state in interpolation).
      *
@@ -254,17 +219,6 @@ template <typename StateToInterpolate> class NetworkedInterpolator {
     bool first_interpolation_window_has_been_initialized = false;
 
     InterpolationFunc interpolate_func;
-
-    /**
-     * @brief a signal which represents the client to server send rate, this allows us to keep a steady interpolation
-     * window going, as the regular rate a which states are registered is a signal with the same average frequency but
-     * more variance,
-     *
-     * @note that the idealized receive signal probably has a phase shift relative to the actual receive times, and
-     * there is nothing we can do about that, and this probably doesn't have a huge impact, I just haven't thought about
-     * how it might have an impact alot and wanted to mention it
-     */
-    PeriodicSignal idealized_receive_signal;
 };
 
 #endif // NETWORKED_INTERPOLATOR_HPP
