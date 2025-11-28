@@ -70,7 +70,7 @@ template <typename StateToInterpolate> class NetworkedInterpolator {
           logging_enabled(logging_enabled), state_to_interpolate_to_string(state_to_interpolate_to_string) {
         networked_periodic_signal_quantizer.output_emitter.template connect<std::optional<StateToInterpolate>>(
             [&](const std::optional<StateToInterpolate> &new_state) {
-                LogSection _(global_logger, "just received new state", logging_enabled);
+                LogSection _(global_logger, "received new state to interpolate signal", logging_enabled);
                 if (new_state.has_value()) {
                     global_logger.debug("had value");
 
@@ -96,6 +96,8 @@ template <typename StateToInterpolate> class NetworkedInterpolator {
                     start_state_changed_synchronization.emit(StartStateChangedSignal{active_start_state.value()});
                 } else {
                     global_logger.debug("no value");
+                    global_logger.debug("setting active_start_state to end_start_state, this will lead to multiple "
+                                        "frames where the entity is stuck in place");
                     // NOTE: this is a very important line, we only ever get here if we haven't registered a new state
                     // since last time this was called, this occurs when the network variance causes one of the packets
                     // to take longer than it regularly would. If we didn't add this line then the active start/end
@@ -113,7 +115,7 @@ template <typename StateToInterpolate> class NetworkedInterpolator {
     }
 
     void log_active_interpolation_window() {
-        if (state_to_interpolate_to_string) {
+        if (state_to_interpolate_to_string and active_start_state and active_end_state) {
             LogSection _(global_logger, "active interpolation window");
             global_logger.debug("START: {}", (*state_to_interpolate_to_string)(active_start_state.value()));
             global_logger.debug("END: {}", (*state_to_interpolate_to_string)(active_end_state.value()));
