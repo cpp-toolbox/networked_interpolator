@@ -70,34 +70,34 @@ template <typename StateToInterpolate> class NetworkedInterpolator {
           logging_enabled(logging_enabled), state_to_interpolate_to_string(state_to_interpolate_to_string) {
         networked_periodic_signal_quantizer.output_emitter.template connect<std::optional<StateToInterpolate>>(
             [&](const std::optional<StateToInterpolate> &new_state) {
-                LogSection _(global_logger, "received new state to interpolate signal", logging_enabled);
+                GlobalLogSection _("received new state to interpolate signal", logging_enabled);
                 if (new_state.has_value()) {
-                    global_logger.debug("had value");
+                    global_logger->debug("had value");
 
                     // startfold initialized first interpolation window
                     if (active_start_state == std::nullopt) {
                         active_start_state = new_state;
-                        global_logger.debug("just initialized first start state");
+                        global_logger->debug("just initialized first start state");
                         return;
                     } else if (active_end_state == std::nullopt) {
                         active_end_state = new_state;
-                        global_logger.debug("just initialized first end state ");
+                        global_logger->debug("just initialized first end state ");
                         first_interpolation_window_has_been_initialized = true;
-                        global_logger.debug("interpolation window is initialized");
+                        global_logger->debug("interpolation window is initialized");
                         start_state_changed_synchronization.emit(StartStateChangedSignal{active_start_state.value()});
                         return;
                     }
                     // endfold
 
-                    global_logger.debug("regular interpolation window change");
+                    global_logger->debug("regular interpolation window change");
                     active_start_state = active_end_state;
                     active_end_state = new_state;
                     // we know this is anew state because we are in the new_state.has_value() case.
                     start_state_changed_synchronization.emit(StartStateChangedSignal{active_start_state.value()});
                 } else {
-                    global_logger.debug("no value");
-                    global_logger.debug("setting active_start_state to end_start_state, this will lead to multiple "
-                                        "frames where the entity is stuck in place");
+                    global_logger->debug("no value");
+                    global_logger->debug("setting active_start_state to end_start_state, this will lead to multiple "
+                                         "frames where the entity is stuck in place");
                     // NOTE: this is a very important line, we only ever get here if we haven't registered a new state
                     // since last time this was called, this occurs when the network variance causes one of the packets
                     // to take longer than it regularly would. If we didn't add this line then the active start/end
@@ -116,12 +116,12 @@ template <typename StateToInterpolate> class NetworkedInterpolator {
 
     void log_active_interpolation_window() {
         if (state_to_interpolate_to_string and active_start_state and active_end_state) {
-            LogSection _(global_logger, "active interpolation window");
-            global_logger.debug("START: {}", (*state_to_interpolate_to_string)(active_start_state.value()));
-            global_logger.debug("END: {}", (*state_to_interpolate_to_string)(active_end_state.value()));
-            global_logger.debug("t: {}", active_t);
+            GlobalLogSection _("active interpolation window");
+            global_logger->debug("START: {}", (*state_to_interpolate_to_string)(active_start_state.value()));
+            global_logger->debug("END: {}", (*state_to_interpolate_to_string)(active_end_state.value()));
+            global_logger->debug("t: {}", active_t);
         } else {
-            global_logger.debug("interpolating between start and end with t : {}", active_t);
+            global_logger->debug("interpolating between start and end with t : {}", active_t);
         }
     }
 
@@ -149,7 +149,7 @@ template <typename StateToInterpolate> class NetworkedInterpolator {
      *     * Otherwise, copy active_end_state to active_start_state to hold the last known state.
      */
     void update() {
-        LogSection _(global_logger, "networked interpolator update", logging_enabled);
+        GlobalLogSection _("networked interpolator update", logging_enabled);
 
         // TODO: do we need a function called get progress at the last periodic signal processing? I think if I want to
         // be super safe, because later down this function we will get the progress and in that time it could have
@@ -157,7 +157,7 @@ template <typename StateToInterpolate> class NetworkedInterpolator {
         networked_periodic_signal_quantizer.update();
 
         if (not first_interpolation_window_has_been_initialized) {
-            global_logger.debug("interpolation window not initialized not running anything");
+            global_logger->debug("interpolation window not initialized not running anything");
             return;
         }
 
@@ -170,8 +170,8 @@ template <typename StateToInterpolate> class NetworkedInterpolator {
         current_interpolated_state = interpolate_func(active_start_state.value(), active_end_state.value(), active_t);
 
         if (state_to_interpolate_to_string) {
-            global_logger.debug("the interpolated state is: {}",
-                                (*state_to_interpolate_to_string)(current_interpolated_state.value()));
+            global_logger->debug("the interpolated state is: {}",
+                                 (*state_to_interpolate_to_string)(current_interpolated_state.value()));
         }
     }
 
