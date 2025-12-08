@@ -21,6 +21,12 @@
  */
 template <typename StateToInterpolate> class NetworkedInterpolator {
   public:
+    struct InterpolationWindow {
+        StateToInterpolate start;
+        StateToInterpolate end;
+        double t;
+    };
+
     using InterpolationFunc =
         std::function<StateToInterpolate(const StateToInterpolate &, const StateToInterpolate &, float)>;
 
@@ -28,7 +34,7 @@ template <typename StateToInterpolate> class NetworkedInterpolator {
         StateToInterpolate state;
     };
 
-    NetworkedPeriodicSignalQuantizer<StateToInterpolate> networked_periodic_signal_quantizer;
+    NetworkedPeriodicSignalQuantizer<StateToInterpolate> networked_periodic_signal_quantizer{3};
 
     bool logging_enabled = false;
 
@@ -134,6 +140,17 @@ template <typename StateToInterpolate> class NetworkedInterpolator {
      */
     void register_new_state(const StateToInterpolate &new_state) {
         networked_periodic_signal_quantizer.push(new_state);
+    }
+
+    std::optional<InterpolationWindow> get_interpolation_window() {
+        auto opt_start = get_active_start_state();
+        auto opt_end = get_active_end_state();
+        auto t = get_active_t();
+
+        if (opt_start.has_value() and opt_end.has_value()) {
+            return InterpolationWindow(opt_start.value(), opt_end.value(), t);
+        }
+        return std::nullopt;
     }
 
     /**
