@@ -76,7 +76,7 @@ template <typename StateToInterpolate> class NetworkedInterpolator {
           logging_enabled(logging_enabled), state_to_interpolate_to_string(state_to_interpolate_to_string) {
         networked_periodic_signal_quantizer.output_emitter.template connect<std::optional<StateToInterpolate>>(
             [&](const std::optional<StateToInterpolate> &new_state) {
-                GlobalLogSection _("received new state to interpolate signal", logging_enabled);
+                GlobalLogSection _("received new state to interpolate signal", this->logging_enabled);
                 if (new_state.has_value()) {
                     global_logger->debug("had value");
 
